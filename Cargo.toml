@@ -7,3 +7,5 @@ edition = "2024"
 publish = false
 
 [dependencies]
+anyhow = { version = "1.0" }
+winit = { version = "0.30" }

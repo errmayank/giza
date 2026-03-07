@@ -1,7 +1,13 @@
 use anyhow::Context;
-use objc2::{MainThreadMarker, rc::Retained};
+use objc2::{MainThreadMarker, rc::Retained, runtime::ProtocolObject};
 use objc2_app_kit::NSView;
-use objc2_quartz_core::CAMetalLayer;
+use objc2_core_foundation::CGSize;
+use objc2_metal::{
+    MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLLoadAction, MTLPixelFormat,
+    MTLRenderPassDescriptor, MTLStoreAction,
+};
+use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalPosition},
@@ -12,10 +18,16 @@ use winit::{
     window::{Window, WindowId},
 };
 
+struct MetalState {
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    command_queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+}
+
 #[derive(Default)]
 struct Giza {
     window: Option<Window>,
     metal_layer: Option<Retained<CAMetalLayer>>,
+    metal_state: Option<MetalState>,
     error: Option<anyhow::Error>,
 }
 
@@ -26,7 +38,10 @@ impl Giza {
         }
     }
 
-    fn retain_ns_view(window_handle: AppKitWindowHandle) -> anyhow::Result<Retained<NSView>> {
+    fn retain_ns_view(
+        _: MainThreadMarker,
+        window_handle: AppKitWindowHandle,
+    ) -> anyhow::Result<Retained<NSView>> {
         let ns_view =
             // Safety: Raw AppKit handle provides a valid `NSView` pointer for the
             // lifetime of `window_handle` and retaining it here on the main thread is okay.
@@ -37,7 +52,7 @@ impl Giza {
     }
 
     fn retain_appkit_view(window: &Window) -> anyhow::Result<Retained<NSView>> {
-        let _main_thread_marker =
+        let main_thread_marker =
             MainThreadMarker::new().context("AppKit view access must happen on the main thread")?;
         let window_handle = window
             .window_handle()
@@ -51,7 +66,7 @@ impl Giza {
             }
         };
 
-        let ns_view = Self::retain_ns_view(app_kit_window_handle)?;
+        let ns_view = Self::retain_ns_view(main_thread_marker, app_kit_window_handle)?;
 
         Ok(ns_view)
     }
@@ -64,6 +79,89 @@ impl Giza {
         ns_view.setLayer(Some(metal_layer.as_ref()));
 
         Ok(metal_layer)
+    }
+
+    fn create_metal_state() -> anyhow::Result<MetalState> {
+        let device =
+            MTLCreateSystemDefaultDevice().context("failed to get the default Metal device")?;
+        let command_queue = device
+            .newCommandQueue()
+            .context("failed to create Metal command queue")?;
+
+        Ok(MetalState {
+            device,
+            command_queue,
+        })
+    }
+
+    fn update_metal_layer_size(window: &Window, metal_layer: &CAMetalLayer) {
+        let window_size = window.inner_size();
+        let scale_factor = window.scale_factor();
+
+        metal_layer.setContentsScale(scale_factor);
+        metal_layer.setDrawableSize(CGSize {
+            width: window_size.width as f64,
+            height: window_size.height as f64,
+        });
+    }
+
+    fn configure_metal_layer(
+        window: &Window,
+        metal_layer: &CAMetalLayer,
+        metal_state: &MetalState,
+    ) {
+        metal_layer.setDevice(Some(metal_state.device.as_ref()));
+        metal_layer.setPixelFormat(MTLPixelFormat::BGRA8Unorm);
+        metal_layer.setFramebufferOnly(true);
+        metal_layer.setMaximumDrawableCount(3);
+        metal_layer.setAllowsNextDrawableTimeout(false);
+
+        Self::update_metal_layer_size(window, metal_layer);
+    }
+
+    fn draw(&mut self) -> anyhow::Result<()> {
+        let metal_layer = self
+            .metal_layer
+            .as_ref()
+            .context("missing CAMetalLayer during redraw")?;
+        let metal_state = self
+            .metal_state
+            .as_ref()
+            .context("missing Metal state during redraw")?;
+
+        let Some(drawable) = metal_layer.nextDrawable() else {
+            return Ok(());
+        };
+
+        let command_buffer = metal_state
+            .command_queue
+            .commandBuffer()
+            .context("failed to create Metal command buffer")?;
+        let render_pass_descriptor = MTLRenderPassDescriptor::new();
+
+        let color_attachment =
+            // Safety: `colorAttachments[0]` is the first valid color attachment slot in Metal.
+            unsafe { render_pass_descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+
+        color_attachment.setTexture(Some(drawable.texture().as_ref()));
+        color_attachment.setLoadAction(MTLLoadAction::Clear);
+        color_attachment.setStoreAction(MTLStoreAction::Store);
+        color_attachment.setClearColor(MTLClearColor {
+            red: 20.0 / 255.0,
+            green: 20.0 / 255.0,
+            blue: 20.0 / 255.0,
+            alpha: 1.0,
+        });
+
+        let command_encoder = command_buffer
+            .renderCommandEncoderWithDescriptor(&render_pass_descriptor)
+            .context("failed to create Metal render command encoder")?;
+
+        command_encoder.endEncoding();
+        command_buffer.presentDrawable(drawable.as_ref());
+        command_buffer.commit();
+
+        Ok(())
     }
 }
 
@@ -113,6 +211,18 @@ impl ApplicationHandler for Giza {
                 }
             };
 
+        let metal_state = match Self::create_metal_state().context("failed to initialize Metal") {
+            Ok(metal_state) => metal_state,
+            Err(error) => {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
+        };
+
+        Self::configure_metal_layer(&window, metal_layer.as_ref(), &metal_state);
+
+        self.metal_state = Some(metal_state);
         self.metal_layer = Some(metal_layer);
         self.window = Some(window);
         self.request_redraw();
@@ -134,7 +244,17 @@ impl ApplicationHandler for Giza {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => {
+                if let Err(error) = self.draw().context("failed to render frame") {
+                    self.error = Some(error);
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                if let Some(metal_layer) = self.metal_layer.as_ref() {
+                    Self::update_metal_layer_size(window, metal_layer.as_ref());
+                }
+
                 self.request_redraw();
             }
             _ => {}
@@ -144,6 +264,7 @@ impl ApplicationHandler for Giza {
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.window = None;
         self.metal_layer = None;
+        self.metal_state = None;
     }
 }
 
